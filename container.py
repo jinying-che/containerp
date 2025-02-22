@@ -1,45 +1,89 @@
 import os
-import sys
 import subprocess
+import shutil
 
-# Constants
-CONTAINER_ROOT = "/tmp/my_container"
-HOSTNAME = "tiny-container"
+# Configuration
+CONTAINER_ROOT = "/tmp/my_container_root"
+CGROUP_PATH = "/sys/fs/cgroup/mycontainer"
+MEMORY_LIMIT = "100M"  # 100MB memory limit
+CPU_LIMIT = "50000"    # 50% of one CPU core (in microseconds)
 
 def setup_filesystem():
-    """Creates an isolated root filesystem for the container."""
-    os.makedirs(CONTAINER_ROOT, exist_ok=True)
-    subprocess.run(["debootstrap", "--variant=minbase", "buster", CONTAINER_ROOT], check=True)
-    print(f"Filesystem created at {CONTAINER_ROOT}")
+    """Create a minimal filesystem if not present."""
+    if not os.path.exists(CONTAINER_ROOT):
+        print(f"Creating minimal filesystem at {CONTAINER_ROOT}...")
+        subprocess.run([
+            "debootstrap", "--variant=minbase", "buster", CONTAINER_ROOT,
+            "http://deb.debian.org/debian/"
+        ], check=True)
+    else:
+        print(f"Filesystem already exists at {CONTAINER_ROOT}.")
+
+def setup_proc():
+    """Ensure /proc exists inside the container root."""
+    proc_path = os.path.join(CONTAINER_ROOT, "proc")
+    os.makedirs(proc_path, exist_ok=True)
+
+def setup_cgroup():
+    """Configure cgroup v2 for memory and CPU restrictions."""
+    print("Setting up cgroups...")
+    os.makedirs(CGROUP_PATH, exist_ok=True)
+
+    # Enable the cgroup for the current process
+    with open(os.path.join(CGROUP_PATH, "cgroup.procs"), "w") as f:
+        f.write(str(os.getpid()))
+
+    # Set memory limit
+    with open(os.path.join(CGROUP_PATH, "memory.max"), "w") as f:
+        f.write(MEMORY_LIMIT)
+
+    # Set CPU limit
+    with open(os.path.join(CGROUP_PATH, "cpu.max"), "w") as f:
+        f.write(f"{CPU_LIMIT} 100000")  # 50% CPU quota (period = 100000us)
+
+def cleanup():
+    """Cleanup cgroups and unmount /proc after container stops."""
+    print("Cleaning up resources...")
+    try:
+        subprocess.run(["umount", "-l", os.path.join(CONTAINER_ROOT, "proc")], check=True)
+    except subprocess.CalledProcessError:
+        print("Warning: Could not unmount /proc, it might have been unmounted already.")
+    shutil.rmtree(CGROUP_PATH, ignore_errors=True)
 
 def run_container():
-    """Creates an isolated container environment using namespaces and chroot."""
+    """Run an isolated container environment."""
     print("Starting container...")
 
-    # Unshare namespaces (PID, Mount, UTS)
-    flags = os.CLONE_NEWPID | os.CLONE_NEWNS | os.CLONE_NEWUTS
-    pid = os.fork()
+    command = [
+        "unshare",              # Isolate namespaces
+        "--mount",              # Isolate mount namespace
+        "--pid",                # Isolate process namespace
+        "--fork",               # Fork a new PID namespace
+        "--uts",                # Isolate hostname
+        "--mount-proc",         # Mount /proc
+        "chroot",               # Change root to the container's filesystem
+        CONTAINER_ROOT,         # Path to minimal filesystem
+        "/bin/bash"             # Start bash shell inside the container
+    ]
 
-    if pid == 0:  # Child process (container process)
-        os.unshare(flags)
-        os.chroot(CONTAINER_ROOT)  # Change root filesystem
-        os.chdir("/")  # Move to the new root
-        subprocess.run(["hostname", HOSTNAME])
-
-        # Mount proc to provide process info inside the container
-        # subprocess.run(["mount", "-t", "proc", "proc", "/proc"], check=True)
-        # os.system("mount -t proc proc /proc")
-
-        # Run a shell inside the container
-        subprocess.run(["/bin/bash"])
-    else:
-        os.waitpid(pid, 0)  # Wait for the child process to exit
-        print("Container stopped.")
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running container: {e}")
+    finally:
+        cleanup()
 
 if __name__ == "__main__":
-    if not os.path.exists(CONTAINER_ROOT + "/bin/bash"):
-        print("Setting up the container filesystem...")
-        setup_filesystem()
+    if os.geteuid() != 0:
+        print("❗ This script requires root privileges. Please run as sudo.")
+        exit(1)
 
-    run_container()
+    try:
+        setup_filesystem()
+        setup_proc()
+        setup_cgroup()
+        run_container()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        cleanup()
 
